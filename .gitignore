@@ -45,11 +45,6 @@ Thumbs.db
 **/service_account.json
 **/*.json.key
 
-# Binary/zip archives
+# Large binary (792MB - too big for GitHub)
 auto.zip
 **/auto.zip
-
-# Large zip archives
-*.zip
-*.tar.gz
-*.rar
