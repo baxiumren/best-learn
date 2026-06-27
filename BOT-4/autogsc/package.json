@@ -1,0 +1,20 @@
+{
+  "name": "index-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for GSC bulk indexing - analyze sitemap, auto-download verification files, request indexing",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
+  },
+  "dependencies": {
+    "archiver": "^6.0.1",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "fast-xml-parser": "^4.3.2",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "puppeteer": "^21.5.0",
+    "telegraf": "^4.15.3"
+  }
+}

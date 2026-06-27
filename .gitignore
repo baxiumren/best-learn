@@ -1,0 +1,55 @@
+# Secrets & config
+.env
+.env.*
+
+# Chrome profile data (bisa besar + ada sesi login)
+**/chrome-profiles/
+**/chrome-profile/
+
+# Node modules
+**/node_modules/
+
+# Bot runtime data
+**/bot-data/
+**/_debug/
+
+# Result folders (generated files)
+**/result/template_result/
+**/result/amp_result/
+**/result/_zips/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Backup files (runtime generated)
+**/_backups/
+
+# Sitemap output
+**/sitemapgenerator/*.xml
+
+# Package lock (optional)
+# package-lock.json
+
+# Chrome uploader profile data
+**/chrome-profile-uploader/
+
+# Tmp files
+**/tmp/
+*.log
+
+# Google service account credentials
+**/service_account.json
+**/*.json.key
+
+# Binary/zip archives
+auto.zip
+**/auto.zip
+
+# Large zip archives
+*.zip
+*.tar.gz
+*.rar

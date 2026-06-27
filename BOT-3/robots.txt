@@ -1,0 +1,17 @@
+User-agent: Googlebot
+User-agent: Slurp
+User-agent: bingbot
+User-agent: baiduspider
+User-agent: adsense
+User-agent: crawler
+User-agent: spider
+User-agent: inspection
+Allow: /
+
+User-agent: Lumendatabase
+Disallow: /
+
+User-agent: *
+Allow: /
+
+Sitemap:https://newlam.ge/sitemap.xml

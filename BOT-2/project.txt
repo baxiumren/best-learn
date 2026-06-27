@@ -1,0 +1,34 @@
+- list domain target
+- list brand
+- auto create amp folder (create folder banyak')
+
+variable template.php:
+- {BRAND}
+- {CANONICAL}
+- {AMP}
+- {LOGO_BRAND}
+- {TEMPLATE_IMAGE}
+- {FAVICON}
+
+variable template_amp.php:
+- {BRAND}
+- {FAVICON}
+- {CANONICAL}
+- {AMP_IMAGE}
+- {MONEY_SITE}
+- {LOGO}
+
+Contoh list brand: liat di file list_brand_example.txt
+Contoh domain target: liat di file domain_target_example.txt
+
+Expected result:
+folder result, didalamnya ada 2 folder. Template result sama amp result. 
+Struktur template result yang seharusnya:
+dicontoh domain_target_example.txt, https://domain.com/2018/07/. Result seharusnya folder 2018, folder 07, isi konten 2018/07/index.php
+contoh 2, https://domain.com/promo-event/, Result seharusnya folder promo-event, isi konten promo-event/index.php
+contoh 3, https://domain.com/category/aplikasi/, Result seharusnya folder category, folder aplikasi, isi konten category/aplikasi/index.php
+Struktur amp result yang seharusnya:
+didalm amp_result ada folder nama amp, didalam folder amp ini:
+dicontoh list_brand_example.txt, SUKATOTO, result seharusnya folder SUKATOTO, isi konten SUKATOTO/index.html
+contoh 2, AKUBET, result seharusnya folder AKUBET, isi konten AKUBET/index.html
+contoh 3, PENIDABET, result seharusnya folder PENIDABET, isi konten PENIDABET/index.html

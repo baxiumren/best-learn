@@ -1,0 +1,1466 @@
+require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+const { spawn } = require('child_process');
+const { Telegraf } = require('telegraf');
+
+// ===== AUTO-START PHP SERVER (localhost:1515) =====
+(function autoStartPhpServer() {
+  const PHP_HOST = '127.0.0.1';
+  const PHP_PORT = process.env.PHP_PORT || '1515';
+  const PHP_ROOT = path.resolve(__dirname, process.env.PHP_ROOT || '../');
+  const checkUrl = `http://${PHP_HOST}:${PHP_PORT}/`;
+
+  // Cek dulu apakah server udah jalan
+  axios.get(checkUrl, { timeout: 1500 })
+    .then(() => {
+      console.log(`✅ PHP server already running at ${checkUrl}`);
+    })
+    .catch(() => {
+      console.log(`🚀 Starting PHP server: ${PHP_HOST}:${PHP_PORT} (root: ${PHP_ROOT})`);
+      const php = spawn('php', ['-S', `${PHP_HOST}:${PHP_PORT}`, '-t', PHP_ROOT], {
+        cwd: PHP_ROOT,
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      php.unref();
+      php.on('error', (err) => {
+        console.error('❌ Failed to start PHP server:', err.message);
+        console.error('   Pastikan PHP terinstall & ada di PATH. Test: `php -v`');
+      });
+      // kasih waktu boot
+      setTimeout(() => {
+        axios.get(checkUrl, { timeout: 2000 })
+          .then(() => console.log(`✅ PHP server up at ${checkUrl}`))
+          .catch(() => console.log(`⚠️ PHP server gagal start — cek manual: php -S ${PHP_HOST}:${PHP_PORT}`));
+      }, 1500);
+    });
+})();
+
+const { analyzeSitemap } = require('./lib/analyzer');
+const { parseTargetsFile, parseSitemapFile, prefixToFolderPath } = require('./lib/targets-parser');
+const inputs = require('./lib/inputs-manager');
+const editor = require('./lib/file-editor');
+const {
+  saveDomainData,
+  loadDomainData,
+  loadStatus,
+  updateStatus,
+  listDomains,
+  deleteDomain,
+  cleanGscFiles,
+  deleteAllDomains,
+  domainDir,
+} = require('./lib/storage');
+const {
+  downloadVerificationFiles,
+  verifyProperties,
+  requestIndexAll,
+} = require('./lib/chrome-worker');
+const { zipFolder } = require('./lib/zipper');
+const { publishAll } = require('./lib/uploader');
+
+// ===== acfolder integration paths =====
+const ACFOLDER_RESULT_PATH = path.resolve(__dirname, process.env.ACFOLDER_RESULT_PATH || '../acfolder/result/template_result');
+const ACFOLDER_TARGETS_FILE = path.resolve(__dirname, process.env.ACFOLDER_TARGETS_FILE || '../acfolder/domain_target.txt');
+const ACFOLDER_GENERATOR_URL = process.env.ACFOLDER_GENERATOR_URL || '';
+
+const TOKEN = process.env.TELEGRAM_TOKEN;
+if (!TOKEN) {
+  console.error('❌ TELEGRAM_TOKEN missing. Copy .env.example to .env and fill it.');
+  process.exit(1);
+}
+
+const ALLOWED = (process.env.ALLOWED_USER_IDS || '')
+  .split(',').map(s => s.trim()).filter(Boolean).map(Number);
+
+const bot = new Telegraf(TOKEN);
+
+// Simple ACL
+bot.use(async (ctx, next) => {
+  if (ALLOWED.length && !ALLOWED.includes(ctx.from?.id)) {
+    return ctx.reply(`❌ Access denied. Your ID: ${ctx.from?.id}`);
+  }
+  return next();
+});
+
+// ============================================
+// GLOBAL middleware: hanya tambah disable_web_page_preview (NO force parse_mode)
+// parse_mode di-set per command secara manual kalau perlu
+// ============================================
+bot.use(async (ctx, next) => {
+  const origReply = ctx.reply.bind(ctx);
+  ctx.reply = (text, extra = {}) => {
+    // Only add disable_web_page_preview, gak force parse_mode
+    return origReply(text, {
+      disable_web_page_preview: true,
+      ...extra,
+    });
+  };
+
+  const origEdit = ctx.telegram.editMessageText.bind(ctx.telegram);
+  ctx.telegram.editMessageText = (chatId, msgId, inlineId, text, extra = {}) => {
+    return origEdit(chatId, msgId, inlineId, text, {
+      disable_web_page_preview: true,
+      ...extra,
+    });
+  };
+
+  return next();
+});
+
+// Global error handler — show errors di terminal + chat
+bot.catch((err, ctx) => {
+  console.error('❌ BOT ERROR:', err);
+  try {
+    ctx.reply(`❌ Bot error: ${err.message || err}\n\nCheck terminal log.`);
+  } catch {}
+});
+
+// Catch unhandled exceptions
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ UNHANDLED REJECTION:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('❌ UNCAUGHT EXCEPTION:', err);
+});
+
+// Lock per-domain biar gak double-run
+const locks = new Set();
+function withLock(domain, fn) {
+  return async (ctx) => {
+    if (locks.has(domain)) return ctx.reply(`⏳ Domain ${domain} masih diproses. Tunggu dulu.`);
+    locks.add(domain);
+    try { await fn(ctx); }
+    finally { locks.delete(domain); }
+  };
+}
+
+// ============================================
+// /start
+// ============================================
+bot.start((ctx) => {
+  ctx.reply(
+`🤖 AutoGSC Bot — full pipeline
+
+1️⃣ INPUT FILES
+/show targets | brands | images
+/check
+/edit <type>  · /append <type>  · /upload <type>
+/done · /cancel
+
+2️⃣ DOMAIN SETUP
+/setdomain    — set domain (auto-edit ping.php + robots.txt)
+/showdomain   — lihat domain sekarang
+
+3️⃣ TEMPLATE PICKER
+/picktemplate — pilih dari stock_template
+/pickamp      — pilih dari stock_amp
+
+4️⃣ TITLE & DESCRIPTION
+/showtitle · /edittitle
+/showdesc  · /editdesc
+(harus include {BRAND} di text baru)
+
+5️⃣ ASSETS
+/showassets · /setassets (wizard 1-per-1)
+
+6️⃣ GENERATE
+/generate    — trigger acfolder/index.php
+/gensitemap  — generate sitemap.xml dari targets
+
+7️⃣ GSC INDEXING
+/scantargets · /prepareinto <domain>
+/ready  — confirm udah login Google (saat prepareinto)
+/cancellogin — batalin login wait
+/verify <domain> · /index <domain>
+
+8️⃣ ZIP & PUBLISH
+/zip — zip template_result (skip _debug,_temp) + amp_result/amp
+       lalu kirim file zip ke chat
+/publishfiles — auto upload semua file ke kodokzuma
+       (5 TXT + 2 ZIP terbaru → kirim list URL ke chat)
+
+9️⃣ CLOUDFLARE PAGES
+/cfpages <name> — deploy amp_result/amp ke CF Pages
+       Contoh: /cfpages mahaslot-amp
+       Output: https://<name>.pages.dev
+
+🧰 Utility
+/list · /status <domain> · /delete <domain> · /reset`
+  );
+});
+
+// ============================================
+// /scan <sitemap_url>
+// ============================================
+bot.command('scan', async (ctx) => {
+  const sitemapUrl = ctx.message.text.split(/\s+/)[1];
+  if (!sitemapUrl) return ctx.reply('Format: `/scan https://domain.com/sitemap.xml`');
+
+  const msg = await ctx.reply('🔍 Fetching & analyzing sitemap...');
+  try {
+    const { data } = await axios.get(sitemapUrl, { timeout: 30000 });
+    const result = await analyzeSitemap(data);
+
+    // Cleanup old data buat domain ini sebelum save (re-scan = fresh start)
+    deleteDomain(result.domain);
+    saveDomainData(result.domain, result, data);
+
+    let report = `📊 *Analysis Report*\n\n`;
+    report += `🌐 Domain : \`${result.domain}\`\n`;
+    report += `📄 Total URL : *${result.totalUrls}*\n`;
+    report += `📂 Prefixes : *${result.prefixes.length}*\n`;
+    report += `📁 GSC files needed : *${result.prefixes.length}*\n`;
+    report += `⚡ Daily quota : *${result.prefixes.length * 10}* URL/hari\n`;
+    report += `📅 Days to index all : *${Math.ceil(result.totalUrls / (result.prefixes.length * 10))}*\n\n`;
+    report += `*Detected prefixes:*\n`;
+    result.prefixes.forEach((p, i) => {
+      const count = (result.urlsByPrefix[p] || []).length;
+      report += `${i + 1}. \`${p}\` — ${count} URL\n`;
+    });
+    report += `\n👉 Next: \`/prepare ${result.domain}\``;
+
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, report);
+  } catch (e) {
+    await ctx.reply(`❌ Scan error: ${e.message}`);
+  }
+});
+
+// ============================================
+// INPUT FILE MANAGEMENT
+// ============================================
+
+// In-memory: track user yang lagi /edit atau /append (next text message = isi)
+const editingState = new Map(); // userId -> { type, mode: 'edit'|'append' }
+const uploadingState = new Map(); // userId -> { type }
+
+function getTypeFromArg(arg) {
+  if (!arg) return null;
+  const t = arg.toLowerCase();
+  if (['targets', 'target', 'domain', 'domains'].includes(t)) return 'targets';
+  if (['brands', 'brand'].includes(t)) return 'brands';
+  if (['images', 'image', 'img'].includes(t)) return 'images';
+  return null;
+}
+
+bot.command('show', (ctx) => {
+  const type = getTypeFromArg(ctx.message.text.split(/\s+/)[1]);
+  if (!type) return ctx.reply('Format: /show <targets|brands|images>');
+
+  const data = inputs.read(type);
+  if (!data.exists) return ctx.reply(`❌ File belum ada: ${inputs.INPUT_TYPES[type].label}`);
+
+  const preview = data.lines.slice(0, 30).join('\n');
+  const more = data.lines.length > 30 ? `\n\n(... +${data.lines.length - 30} lebih)` : '';
+  ctx.reply(
+    `📄 ${inputs.INPUT_TYPES[type].label} (${data.lines.length} baris)\n\n${preview}${more}`
+  );
+});
+
+bot.command('check', (ctx) => {
+  const result = inputs.validateAll();
+  let txt = `🔎 *Input Validation*\n\n`;
+  txt += `📄 Targets : ${result.targets} URL\n`;
+  txt += `🏷️ Brands  : ${result.brands} brand\n`;
+  txt += `🖼️ Images  : ${result.images} URL\n\n`;
+  if (result.ok) {
+    txt += `✅ *Semua sinkron* (${result.targets} entries)\n`;
+    txt += `_Siap di-generate lewat acfolder!_`;
+  } else {
+    txt += `⚠️ *Ada masalah:*\n`;
+    result.issues.forEach(i => txt += `• ${i}\n`);
+  }
+  ctx.reply(txt);
+});
+
+// ============================================
+// [2] DOMAIN SETUP — /set-domain, /show-domain
+// ============================================
+
+// State buat 1-step prompt (domain, title, desc, asset wizard)
+const promptState = new Map(); // userId -> { kind, ...extra }
+
+bot.command('showdomain', (ctx) => {
+  const d = editor.getCurrentDomain();
+  if (!d) return ctx.reply('❌ Domain belum di-set. Pake /set-domain dulu.');
+  ctx.reply(`🌐 Current domain: ${d}\n\nUbah: /set-domain`);
+});
+
+bot.command('setdomain', (ctx) => {
+  promptState.set(ctx.from.id, { kind: 'set-domain' });
+  const curr = editor.getCurrentDomain();
+  ctx.reply(
+    `🌐 Set Domain\n\n` +
+    (curr ? `Current: ${curr}\n\n` : '') +
+    `Kirim domain dengan format:\nhttps://domain.com/\n\n` +
+    `Akan auto-update:\n• ping.php (sitemap URL)\n• robots.txt (Sitemap line)\n\n` +
+    `Atau /cancel`
+  );
+});
+
+// ============================================
+// [3] TEMPLATE PICKER — /pick-template, /pick-amp
+// ============================================
+
+bot.command('picktemplate', (ctx) => {
+  const list = editor.listStockTemplates();
+  if (list.length === 0) return ctx.reply('❌ Folder stock_template/ kosong.');
+  promptState.set(ctx.from.id, { kind: 'pick-template', list });
+  let msg = `📑 *Pilih Template (Landing Page)*\n\n`;
+  list.forEach((f, i) => { msg += `${i + 1}. \`${f}\`\n`; });
+  msg += `\nKirim angka (1-${list.length}) atau nama file.\n\`/cancel\` buat batal.`;
+  ctx.reply(msg);
+});
+
+bot.command('pickamp', (ctx) => {
+  const list = editor.listStockAmpTemplates();
+  if (list.length === 0) return ctx.reply('❌ Folder stock_amp/ kosong.');
+  promptState.set(ctx.from.id, { kind: 'pick-amp', list });
+  let msg = `📱 *Pilih Template (AMP)*\n\n`;
+  list.forEach((f, i) => { msg += `${i + 1}. \`${f}\`\n`; });
+  msg += `\nKirim angka (1-${list.length}) atau nama file.\n\`/cancel\` buat batal.`;
+  ctx.reply(msg);
+});
+
+// ============================================
+// [4] TITLE & DESCRIPTION
+// ============================================
+
+bot.command('showtitle', (ctx) => {
+  const data = editor.getTitleDesc();
+  let msg = `📰 *Current Title*\n\n`;
+  msg += `*template.php:*\n\`${data.template.title || '(none)'}\`\n\n`;
+  msg += `*template_amp.php:*\n\`${data.templateAmp.title || '(none)'}\``;
+  ctx.reply(msg);
+});
+
+bot.command('edittitle', (ctx) => {
+  promptState.set(ctx.from.id, { kind: 'edit-title' });
+  const data = editor.getTitleDesc();
+  ctx.reply(
+    `📰 *Edit Title*\n\n` +
+    `Current (template.php):\n\`${data.template.title || '(none)'}\`\n\n` +
+    `Kirim title baru. *WAJIB include \`{BRAND}\`* placeholder.\n\n` +
+    `Contoh:\n\`Bergabung Di {BRAND} - Slot Online Terpercaya\`\n\n\`/cancel\` buat batal.`
+  );
+});
+
+bot.command('showdesc', (ctx) => {
+  const data = editor.getTitleDesc();
+  let msg = `📝 *Current Description*\n\n`;
+  msg += `*template.php:*\n\`${data.template.desc || '(none)'}\`\n\n`;
+  msg += `*template_amp.php:*\n\`${data.templateAmp.desc || '(none)'}\``;
+  ctx.reply(msg);
+});
+
+bot.command('editdesc', (ctx) => {
+  promptState.set(ctx.from.id, { kind: 'edit-desc' });
+  const data = editor.getTitleDesc();
+  ctx.reply(
+    `📝 *Edit Description*\n\n` +
+    `Current (template.php):\n\`${data.template.desc || '(none)'}\`\n\n` +
+    `Kirim deskripsi baru. *WAJIB include \`{BRAND}\`*.\n\n\`/cancel\` buat batal.`
+  );
+});
+
+// ============================================
+// [5] ASSETS WIZARD
+// ============================================
+
+bot.command('showassets', (ctx) => {
+  const a = editor.readAssets();
+  if (!a) return ctx.reply('❌ index.php not found');
+  let msg = `🎨 *Current Assets* (index.php defaults)\n\n`;
+  for (const k of editor.ASSET_KEYS) {
+    msg += `*${k}:*\n\`${a[k] || '(empty)'}\`\n\n`;
+  }
+  ctx.reply(msg);
+});
+
+bot.command('setassets', (ctx) => {
+  const curr = editor.readAssets() || {};
+  promptState.set(ctx.from.id, {
+    kind: 'set-assets',
+    step: 0,
+    current: curr,
+    updates: {},
+  });
+  askNextAsset(ctx);
+});
+
+function askNextAsset(ctx) {
+  const st = promptState.get(ctx.from.id);
+  if (!st || st.kind !== 'set-assets') return;
+  if (st.step >= editor.ASSET_KEYS.length) {
+    // Done — apply
+    const results = editor.writeAssetsBulk(st.updates);
+    promptState.delete(ctx.from.id);
+    let msg = `✅ *Assets Updated*\n\n`;
+    if (results.length === 0) {
+      msg += `_(no changes)_`;
+    } else {
+      results.forEach(r => {
+        msg += `${r.ok ? '✅' : '❌'} *${r.key}*: \`${r.value}\`\n`;
+        if (!r.ok) msg += `   _${r.error}_\n`;
+      });
+    }
+    return ctx.reply(msg);
+  }
+  const key = editor.ASSET_KEYS[st.step];
+  const cur = st.current[key] || '(empty)';
+  ctx.reply(
+    `🎨 *[${st.step + 1}/${editor.ASSET_KEYS.length}] ${key}*\n\n` +
+    `Current: \`${cur}\`\n\n` +
+    `Kirim URL baru, atau \`/skip\` untuk gak ubah, atau \`/cancel\`.`
+  );
+}
+
+bot.command('skip', (ctx) => {
+  const st = promptState.get(ctx.from.id);
+  if (st?.kind !== 'set-assets') return ctx.reply('🚫 Gak ada wizard aktif');
+  st.step++;
+  askNextAsset(ctx);
+});
+
+// ============================================
+// [6] GEN-SITEMAP — copy targets, trigger PHP, return XML
+// ============================================
+
+bot.command('gensitemap', async (ctx) => {
+  const msg = await ctx.reply('🗺️ Generating sitemap...');
+  try {
+    // 1. Copy domain_target.txt → sitemap_domain.txt
+    const cp = editor.copyTargetsToSitemap();
+
+    // 2. Trigger PHP generator via HTTP (kalo URL ada)
+    const url = process.env.ACFOLDER_SITEMAP_GEN_URL;
+    let phpStatus = 'skipped (no ACFOLDER_SITEMAP_GEN_URL)';
+    if (url) {
+      try {
+        const res = await axios.get(url, { timeout: 30000 });
+        phpStatus = `HTTP ${res.status}`;
+      } catch (e) {
+        phpStatus = `error: ${e.message}`;
+      }
+    }
+
+    // 3. Read result
+    const out = editor.readSitemapOutput();
+
+    let report = `🗺️ *Sitemap Generation*\n\n`;
+    report += `📄 Copied: \`${path.basename(cp.dest)}\` (${cp.lineCount} URL)\n`;
+    report += `🔨 PHP gen: ${phpStatus}\n`;
+    if (out) {
+      report += `✅ Output: \`${path.basename(out.file)}\`\n`;
+      report += `📏 Size: ${(out.size / 1024).toFixed(1)} KB\n`;
+      report += `🕒 Modified: ${out.modified.toLocaleString()}\n`;
+    } else {
+      report += `⚠️ Output file gak ditemukan\n`;
+    }
+    report += `\n💡 Upload \`sitemap.xml\` ke root domain biar Google bisa baca.`;
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, report);
+
+    // Attach sitemap.xml file
+    if (out) {
+      await ctx.replyWithDocument({ source: out.file, filename: 'sitemap.xml' });
+    }
+  } catch (e) {
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `❌ ${e.message}`);
+  }
+});
+
+// ============================================
+// [original /edit untuk input files]
+// ============================================
+
+bot.command('edit', (ctx) => {
+  const type = getTypeFromArg(ctx.message.text.split(/\s+/)[1]);
+  if (!type) return ctx.reply('Format: `/edit <targets|brands|images>`\n\nSetelah itu paste isi baru (1 entry per baris). Akhiri dengan /done atau /cancel.');
+
+  editingState.set(ctx.from.id, { type, mode: 'edit', buffer: [] });
+  ctx.reply(
+    `✏️ *Editing ${inputs.INPUT_TYPES[type].label}*\n\n` +
+    `Paste isi baru — boleh multi-line, boleh multi-message.\n\n` +
+    `Ketik \`/done\` buat save (replace), \`/cancel\` buat batal.`
+  );
+});
+
+bot.command('append', (ctx) => {
+  const type = getTypeFromArg(ctx.message.text.split(/\s+/)[1]);
+  if (!type) return ctx.reply('Format: `/append <targets|brands|images>`');
+
+  editingState.set(ctx.from.id, { type, mode: 'append', buffer: [] });
+  ctx.reply(
+    `➕ *Appending to ${inputs.INPUT_TYPES[type].label}*\n\n` +
+    `Kirim baris baru (boleh multi-message).\n\nKetik \`/done\` buat save, \`/cancel\` buat batal.`
+  );
+});
+
+bot.command('done', (ctx) => {
+  const state = editingState.get(ctx.from.id);
+  if (!state) return ctx.reply('❌ Gak ada session editing aktif.');
+  editingState.delete(ctx.from.id);
+
+  const content = state.buffer.join('\n');
+  if (!content.trim()) return ctx.reply('❌ Buffer kosong, gak save.');
+
+  try {
+    const fn = state.mode === 'append' ? inputs.append : inputs.write;
+    const result = fn(state.type, content);
+    let msg = `✅ Saved! ${inputs.INPUT_TYPES[state.type].label}\n`;
+    msg += `📄 Total: ${result.lineCount} baris\n`;
+    if (result.backupPath) msg += `💾 Backup: ${path.basename(result.backupPath)}\n`;
+    msg += `\n💡 Jalankan /check buat validasi sinkronisasi.`;
+    ctx.reply(msg);
+  } catch (e) {
+    ctx.reply(`❌ Save error: ${e.message}`);
+  }
+});
+
+bot.command('cancel', (ctx) => {
+  editingState.delete(ctx.from.id);
+  uploadingState.delete(ctx.from.id);
+  promptState.delete(ctx.from.id);
+  ctx.reply('🚫 Cancelled.');
+});
+
+bot.command('upload', (ctx) => {
+  const type = getTypeFromArg(ctx.message.text.split(/\s+/)[1]);
+  if (!type) return ctx.reply('Format: `/upload <targets|brands|images>`\n\nSetelah itu, kirim file .txt sebagai dokumen Telegram.');
+
+  uploadingState.set(ctx.from.id, { type });
+  ctx.reply(
+    `📤 *Waiting for upload: ${inputs.INPUT_TYPES[type].label}*\n\n` +
+    `Kirim file .txt sebagai dokumen sekarang.\n_(file lama akan di-backup auto)_\n\nAtau \`/cancel\`.`
+  );
+});
+
+// Handle uploaded document
+bot.on('document', async (ctx) => {
+  const state = uploadingState.get(ctx.from.id);
+  if (!state) return; // bukan kontex upload
+
+  try {
+    const file = ctx.message.document;
+    const fileLink = await ctx.telegram.getFileLink(file.file_id);
+    const { data } = await axios.get(fileLink.href, { responseType: 'text' });
+
+    // ===== CEK DUPLIKAT DI DALAM FILE YANG DI-UPLOAD =====
+    const dupCheck = inputs.detectDuplicates(data);
+    if (dupCheck.hasDuplicates) {
+      const typeLabel = inputs.INPUT_TYPES[state.type].label;
+      let msg = `⚠️ *Duplikat ditemukan di file upload!*\n\n`;
+      msg += `📄 File: ${typeLabel}\n`;
+      msg += `📊 Total: ${dupCheck.totalCount} baris, unik: ${dupCheck.uniqueCount}\n`;
+      msg += `🔴 Duplikat: *${dupCheck.duplicates.length}* entry\n\n`;
+
+      // Tampilin max 10 duplicate
+      const showLimit = 10;
+      const toShow = dupCheck.duplicates.slice(0, showLimit);
+      msg += `*Daftar duplikat:*\n`;
+      for (const d of toShow) {
+        msg += `• \`${d.entry}\`\n  ↳ muncul *${d.count}×* di baris ${d.lineNumbers.join(', ')}\n`;
+      }
+      if (dupCheck.duplicates.length > showLimit) {
+        msg += `\n_+${dupCheck.duplicates.length - showLimit} duplikat lainnya..._\n`;
+      }
+
+      msg += `\n💡 *Action:* Ganti link/entry duplikat dengan yang baru & unik, lalu \`/upload ${state.type}\` ulang.`;
+      // State KEEP biar user bisa re-upload langsung
+      return ctx.reply(msg);
+    }
+
+    // ===== AMAN, OVERWRITE FILE =====
+    uploadingState.delete(ctx.from.id);
+    const result = inputs.write(state.type, data);
+    let msg = `✅ Uploaded! ${inputs.INPUT_TYPES[state.type].label}\n`;
+    msg += `📄 Total: ${result.lineCount} baris (semua unik ✨)\n`;
+    if (result.backupPath) msg += `💾 Backup: ${path.basename(result.backupPath)}\n`;
+    msg += `\n💡 Pakai /check buat validasi.`;
+    ctx.reply(msg);
+  } catch (e) {
+    uploadingState.delete(ctx.from.id);
+    ctx.reply(`❌ Upload error: ${e.message}`);
+  }
+});
+
+// Capture text messages — handle promptState first, then editingState buffer
+bot.on('text', async (ctx, next) => {
+  const text = ctx.message.text;
+  if (text.startsWith('/')) return next?.();
+
+  // ===== promptState handlers (single-shot prompts) =====
+  const ps = promptState.get(ctx.from.id);
+  if (ps) {
+    try {
+      if (ps.kind === 'set-domain') {
+        const r = editor.setDomain(text);
+        promptState.delete(ctx.from.id);
+        let msg = `✅ *Domain Set*\n\n🌐 \`${r.domain}\`\n📍 Sitemap: \`${r.sitemapUrl}\`\n\n`;
+        r.results.forEach(x => { msg += `• ${x.file}: _${x.status}_\n`; });
+        return ctx.reply(msg);
+      }
+
+      if (ps.kind === 'pick-template' || ps.kind === 'pick-amp') {
+        const idx = parseInt(text, 10);
+        let chosen = isNaN(idx) ? text.trim() : ps.list[idx - 1];
+        if (!chosen) return ctx.reply('❌ Pilihan invalid, coba lagi atau /cancel');
+        promptState.delete(ctx.from.id);
+        const fn = ps.kind === 'pick-template' ? editor.pickTemplate : editor.pickAmpTemplate;
+        const target = ps.kind === 'pick-template' ? 'template.php' : 'template_amp.php';
+        const r = fn(chosen);
+        return ctx.reply(`✅ Copied: \`${r.filename}\` → \`${target}\``);
+      }
+
+      if (ps.kind === 'edit-title') {
+        const results = editor.setTitle(text);
+        promptState.delete(ctx.from.id);
+        let msg = `✅ *Title Updated*\n\n*New:*\n\`${text}\`\n\n`;
+        results.forEach(r => {
+          msg += `${r.changed ? '✅' : '⚠️'} *${r.file}*`;
+          if (r.changed) msg += ` (${r.count} occurrences)\n`;
+          else msg += `: _${r.reason}_\n`;
+        });
+        return ctx.reply(msg);
+      }
+
+      if (ps.kind === 'edit-desc') {
+        const results = editor.setDescription(text);
+        promptState.delete(ctx.from.id);
+        let msg = `✅ *Description Updated*\n\n*New:*\n\`${text}\`\n\n`;
+        results.forEach(r => {
+          msg += `${r.changed ? '✅' : '⚠️'} *${r.file}*`;
+          if (r.changed) msg += ` (${r.count} occurrences)\n`;
+          else msg += `: _${r.reason}_\n`;
+        });
+        return ctx.reply(msg);
+      }
+
+      if (ps.kind === 'set-assets') {
+        const key = editor.ASSET_KEYS[ps.step];
+        ps.updates[key] = text.trim();
+        ps.step++;
+        return askNextAsset(ctx);
+      }
+    } catch (e) {
+      promptState.delete(ctx.from.id);
+      return ctx.reply(`❌ Error: ${e.message}`);
+    }
+  }
+
+  // ===== editingState handlers (multi-line buffer for input files) =====
+  const state = editingState.get(ctx.from.id);
+  if (!state) return next?.();
+  state.buffer.push(text);
+  ctx.reply(`📥 Buffered ${state.buffer.length} message(s). Ketik \`/done\` kalo udah selesai.`);
+});
+
+// ============================================
+// /generate — trigger acfolder PHP generator
+// ============================================
+bot.command('generate', async (ctx) => {
+  if (!ACFOLDER_GENERATOR_URL) {
+    return ctx.reply(
+      `❌ \`ACFOLDER_GENERATOR_URL\` belum di-set di .env\n\n` +
+      `Set ke URL acfolder index.php (contoh: \`http://localhost/acfolder/acfolder/\`)\n\n` +
+      `Atau lo bisa run manual lewat browser & balik ke sini buat /scantargets.`
+    );
+  }
+
+  // Cek validasi dulu
+  const valid = inputs.validateAll();
+  if (!valid.ok) {
+    return ctx.reply(
+      `⚠️ *Input belum valid:*\n${valid.issues.map(i => `• ${i}`).join('\n')}\n\nFix dulu sebelum generate.`
+    );
+  }
+
+  const msg = await ctx.reply(`🔨 Triggering acfolder generator...\n_(${ACFOLDER_GENERATOR_URL})_`);
+  try {
+    const form = new URLSearchParams({ generate: '1' }).toString();
+    const res = await axios.post(ACFOLDER_GENERATOR_URL, form, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 60000,
+      maxRedirects: 0,
+      validateStatus: () => true,
+    });
+
+    // Try to extract message from HTML response
+    const html = res.data || '';
+    let resultMsg = '';
+    const matchSuccess = html.match(/<div class="message success">([^<]+)</);
+    const matchError = html.match(/<div class="message error">([^<]+)</);
+    if (matchSuccess) resultMsg = `✅ ${matchSuccess[1].trim()}`;
+    else if (matchError) resultMsg = `❌ ${matchError[1].trim()}`;
+    else resultMsg = `📋 HTTP ${res.status} (cek hasilnya di folder result/)`;
+
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null,
+      `🔨 *Generator Done*\n\n${resultMsg}\n\n👉 Next: \`/scantargets\` lalu \`/prepareinto <domain>\``
+    );
+  } catch (e) {
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null,
+      `❌ Trigger error: ${e.message}\n\n_Tip: pastikan XAMPP/web server jalan._`
+    );
+  }
+});
+
+// ============================================
+// /scantargets — baca sitemap.xml (output dari /gensitemap)
+// Fallback ke domain_target.txt kalo sitemap belum ada
+// ============================================
+const ACFOLDER_SITEMAP_OUTPUT = path.resolve(__dirname, process.env.ACFOLDER_SITEMAP_OUTPUT || '../sitemapgenerator/sitemap.xml');
+
+bot.command('scantargets', async (ctx) => {
+  const useSitemap = fs.existsSync(ACFOLDER_SITEMAP_OUTPUT);
+  const sourceFile = useSitemap ? ACFOLDER_SITEMAP_OUTPUT : ACFOLDER_TARGETS_FILE;
+  const sourceLabel = useSitemap ? 'sitemap.xml' : 'domain_target.txt';
+
+  if (!fs.existsSync(sourceFile)) {
+    return ctx.reply(
+      `❌ Source not found.\n\n` +
+      `Sitemap: \`${ACFOLDER_SITEMAP_OUTPUT}\`\n` +
+      `Targets: \`${ACFOLDER_TARGETS_FILE}\`\n\n` +
+      `💡 Run \`/gensitemap\` dulu untuk generate sitemap.xml.`
+    );
+  }
+
+  const msg = await ctx.reply(`🔍 Reading ${sourceLabel}...`);
+  try {
+    const byDomain = useSitemap
+      ? parseSitemapFile(ACFOLDER_SITEMAP_OUTPUT)
+      : parseTargetsFile(ACFOLDER_TARGETS_FILE);
+    const domains = Object.keys(byDomain);
+
+    if (domains.length === 0) {
+      return ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, null,
+        `❌ No valid URLs found in ${sourceLabel}`
+      );
+    }
+
+    // Save per domain
+    for (const d of domains) {
+      const cfg = byDomain[d];
+      deleteDomain(d);
+      saveDomainData(d, { ...cfg, source: useSitemap ? 'sitemap' : 'targets' }, JSON.stringify(cfg, null, 2));
+    }
+
+    let report = `📊 *Targets Analysis* (hierarchical prefix)\n\n`;
+    report += `📄 Source: \`${sourceLabel}\`${useSitemap ? ' ✨' : ''}\n`;
+    report += `🌐 Domains found: *${domains.length}*\n\n`;
+
+    for (const d of domains) {
+      const cfg = byDomain[d];
+      report += `*${d}*\n`;
+      report += `  • ${cfg.totalUrls} URL → *${cfg.prefixes.length} property* (max 10 URL/property)\n`;
+      report += `  • Quota: ${cfg.prefixes.length * 10} URL/hari\n`;
+      // Tampilin prefix detail (max 8 baris biar gak kepanjangan)
+      const prefixList = cfg.prefixes.slice(0, 8);
+      for (const p of prefixList) {
+        const urlCount = (cfg.urlsByPrefix[p] || []).length;
+        report += `  ◦ \`${p}\` (${urlCount} URL)\n`;
+      }
+      if (cfg.prefixes.length > 8) {
+        report += `  ◦ ... +${cfg.prefixes.length - 8} more prefix\n`;
+      }
+      report += `\n`;
+    }
+
+    report += `👉 Next: \`/prepareinto <domain>\``;
+    if (domains.length === 1) report += `\nExample: \`/prepareinto ${domains[0]}\``;
+
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, report);
+  } catch (e) {
+    await ctx.reply(`❌ Error: ${e.message}`);
+  }
+});
+
+// ============================================
+// Login Ready State — user kirim /ready setelah login Google manual
+// ============================================
+const loginReadyState = new Map(); // userId -> { resolve, timeoutHandle }
+
+bot.command('ready', async (ctx) => {
+  const state = loginReadyState.get(ctx.from.id);
+  if (!state) {
+    return ctx.reply('ℹ️ Gak ada session yang nunggu login. Run `/prepareinto <domain>` dulu.');
+  }
+  clearTimeout(state.timeoutHandle);
+  loginReadyState.delete(ctx.from.id);
+  state.resolve();
+  await ctx.reply('✅ *Ready confirmed!* Lanjut download GSC files...');
+});
+
+bot.command(['cancellogin', 'cancel-login'], async (ctx) => {
+  const state = loginReadyState.get(ctx.from.id);
+  if (!state) {
+    return ctx.reply('ℹ️ Gak ada session login yang aktif.');
+  }
+  clearTimeout(state.timeoutHandle);
+  loginReadyState.delete(ctx.from.id);
+  state.reject?.(new Error('User cancelled login'));
+  await ctx.reply('🚫 Login dibatalkan. Bot stop processing.');
+});
+
+// ============================================
+// /cfpages <project-name> — deploy amp_result/amp ke Cloudflare Pages
+// Pakai wrangler CLI (wrangler login dulu setup-nya)
+// ============================================
+const { spawn: spawnCfg } = require('child_process');
+const ACFOLDER_AMP_SOURCE_PATH = path.resolve(__dirname, '../result/amp_result/amp');
+
+function validateCfName(name) {
+  if (!name) return 'Nama project wajib diisi';
+  if (name.length > 58) return 'Nama max 58 chars';
+  if (!/^[a-z0-9-]+$/.test(name)) return 'Cuma boleh lowercase, angka, dan hyphen (-)';
+  if (name.startsWith('-') || name.endsWith('-')) return 'Tidak boleh diawali/diakhiri hyphen';
+  return null;
+}
+
+bot.command('cfpages', async (ctx) => {
+  const args = ctx.message.text.split(/\s+/).slice(1);
+  const projectName = args[0];
+
+  const invalid = validateCfName(projectName);
+  if (invalid) {
+    return ctx.reply(
+      `❌ ${invalid}\n\n` +
+      `Format: /cfpages <project-name>\n` +
+      `Contoh: /cfpages mahaslot-amp\n\n` +
+      `Naming rules:\n` +
+      `✅ Lowercase: a-z\n` +
+      `✅ Angka: 0-9\n` +
+      `✅ Hyphen: -\n` +
+      `❌ NO underscore, dot, spasi`
+    );
+  }
+
+  if (!fs.existsSync(ACFOLDER_AMP_SOURCE_PATH)) {
+    return ctx.reply(`❌ Folder gak ada: ${ACFOLDER_AMP_SOURCE_PATH}`);
+  }
+
+  // Count files
+  const fileCount = fs.readdirSync(ACFOLDER_AMP_SOURCE_PATH).length;
+
+  await ctx.reply(
+    `🚀 CF Pages Deploy\n\n` +
+    `📦 Project: ${projectName}\n` +
+    `📁 Source: ${ACFOLDER_AMP_SOURCE_PATH}\n` +
+    `📊 Items: ${fileCount}\n\n` +
+    `Running wrangler deploy...`
+  );
+
+  const msg = await ctx.reply(`⏳ Deploying to Cloudflare Pages...`);
+
+  // Run wrangler deploy
+  const startTime = Date.now();
+  const wranglerProcess = spawnCfg('wrangler', [
+    'pages', 'deploy', ACFOLDER_AMP_SOURCE_PATH,
+    '--project-name', projectName,
+    '--commit-dirty=true',
+  ], { shell: true });
+
+  let stdout = '';
+  let stderr = '';
+  wranglerProcess.stdout.on('data', (data) => { stdout += data.toString(); });
+  wranglerProcess.stderr.on('data', (data) => { stderr += data.toString(); });
+
+  wranglerProcess.on('close', (code) => {
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const combined = stdout + '\n' + stderr;
+
+    // Parse URL: format https://<hash>.<name>.pages.dev atau https://<name>.pages.dev
+    const urlMatch = combined.match(/https:\/\/[\w-]+\.pages\.dev/g);
+    const previewUrl = urlMatch ? urlMatch[0] : null;
+    const productionUrl = `https://${projectName}.pages.dev`;
+
+    if (code === 0 && previewUrl) {
+      const report =
+        `✅ Deploy Success!\n\n` +
+        `📦 Project: ${projectName}\n` +
+        `🌐 Production: ${productionUrl}\n` +
+        `🔍 Preview: ${previewUrl}\n` +
+        `📊 Files: ${fileCount}\n` +
+        `⏱️ Time: ${elapsed}s\n\n` +
+        `Tunggu 30-60 detik untuk DNS propagation.`;
+      ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, report).catch(() => {});
+    } else {
+      // Trim error log buat Telegram (max 1500 char)
+      const errSnippet = combined.slice(-1500);
+      ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, null,
+        `❌ Deploy Failed (exit code ${code})\n\n` +
+        `${errSnippet}\n\n` +
+        `💡 Cek terminal log buat detail.`
+      ).catch(() => {});
+      console.error('[cfpages] wrangler stderr:', stderr);
+      console.error('[cfpages] wrangler stdout:', stdout);
+    }
+  });
+
+  wranglerProcess.on('error', (err) => {
+    ctx.telegram.editMessageText(
+      ctx.chat.id, msg.message_id, null,
+      `❌ Wrangler not found atau error: ${err.message}\n\n` +
+      `💡 Install: npm install -g wrangler\n` +
+      `💡 Login: wrangler login`
+    ).catch(() => {});
+  });
+});
+
+// ============================================
+// /publishfiles — upload semua file (txt + zip) ke kodokzuma → kirim list URL
+// ============================================
+const PUBLISH_BASE_URL = process.env.PUBLISH_BASE_URL || 'https://kodokzuma.gaterlaluyakin.xyz/';
+const PUBLISH_USERNAME = process.env.PUBLISH_USERNAME || 'suparmanto';
+const PUBLISH_PASSWORD = process.env.PUBLISH_PASSWORD || 'supratbromantap2';
+
+bot.command('publishfiles', async (ctx) => {
+  // Define source files
+  const acRoot = path.resolve(__dirname, '..');
+  const zipsDir = path.resolve(__dirname, '../result/_zips');
+
+  const txtFiles = [
+    { name: 'template.php',         path: path.join(acRoot, 'template.php') },
+    { name: 'template_amp.php',     path: path.join(acRoot, 'template_amp.php') },
+    { name: 'robots.txt',           path: path.join(acRoot, 'robots.txt') },
+    { name: 'ping.php',             path: path.join(acRoot, 'ping.php') },
+    { name: 'sitemap.xml',          path: path.join(acRoot, 'sitemapgenerator/sitemap.xml') },
+  ];
+
+  // Cari latest zip files
+  let zipFiles = [];
+  if (fs.existsSync(zipsDir)) {
+    const allZips = fs.readdirSync(zipsDir)
+      .filter(f => f.endsWith('.zip'))
+      .map(f => ({ name: f, path: path.join(zipsDir, f), mtime: fs.statSync(path.join(zipsDir, f)).mtimeMs }));
+    // Pick latest template_result + latest amp_result
+    const latestTemplate = allZips.filter(z => z.name.startsWith('template_result_')).sort((a, b) => b.mtime - a.mtime)[0];
+    const latestAmp = allZips.filter(z => z.name.startsWith('amp_result_')).sort((a, b) => b.mtime - a.mtime)[0];
+    if (latestTemplate) zipFiles.push({ name: 'template_result.zip', path: latestTemplate.path });
+    if (latestAmp) zipFiles.push({ name: 'amp_result.zip', path: latestAmp.path });
+  }
+
+  if (zipFiles.length === 0) {
+    return ctx.reply('⚠️ Belum ada zip di `result/_zips/`. Run `/zip` dulu.');
+  }
+
+  await ctx.reply(
+    `📤 *Publish Files Started*\n\n` +
+    `📝 TXT: ${txtFiles.length} files\n` +
+    `📦 ZIP: ${zipFiles.length} files\n\n` +
+    `_Chrome bakal kebuka, auto login..._`
+  );
+
+  const msg = await ctx.reply('🚀 Starting upload...');
+  let lastEdit = 0;
+
+  publishAll({
+    baseUrl: PUBLISH_BASE_URL,
+    username: PUBLISH_USERNAME,
+    password: PUBLISH_PASSWORD,
+    txtFiles,
+    zipFiles,
+    onProgress: ({ kind, current, total, name }) => {
+      const now = Date.now();
+      if (now - lastEdit < 2000 && current !== total) return;
+      lastEdit = now;
+      const emoji = kind === 'txt' ? '📝' : '📦';
+      ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, null,
+        `${emoji} [${current}/${total}] Uploading ${kind.toUpperCase()}\n\`${name}\``
+      ).catch(() => {});
+    },
+  }).then(results => {
+    let report = `✅ *Publish Result*\n\n`;
+    const ok = results.filter(r => r.success).length;
+    report += `📊 Total: ${ok}/${results.length} success\n\n`;
+
+    // Group by type — URL pakai inline code (backtick) biar gak auto-preview
+    const txtResults = results.filter(r => r.type === 'txt');
+    const zipResults = results.filter(r => r.type === 'zip');
+
+    if (txtResults.length) {
+      report += `📝 *TXT Files:*\n`;
+      txtResults.forEach(r => {
+        report += `${r.success ? '✅' : '❌'} \`${r.name}\`\n`;
+        if (r.url) report += `   → \`${r.url}\`\n`;
+        if (r.error) report += `   _(${r.error})_\n`;
+      });
+      report += `\n`;
+    }
+    if (zipResults.length) {
+      report += `📦 *ZIP Files:*\n`;
+      zipResults.forEach(r => {
+        report += `${r.success ? '✅' : '❌'} \`${r.name}\`\n`;
+        if (r.url) report += `   → \`${r.url}\`\n`;
+        if (r.error) report += `   _(${r.error})_\n`;
+      });
+    }
+
+    ctx.telegram.editMessageText(
+      ctx.chat.id, msg.message_id, null, report,
+      { parse_mode: 'Markdown', disable_web_page_preview: true }
+    ).catch(() => {});
+
+    // Kirim juga raw list URL biar gampang copy (code block multi-line)
+    const urlsOnly = results.filter(r => r.success && r.url).map(r => `${r.name}: ${r.url}`).join('\n');
+    if (urlsOnly) {
+      ctx.reply(
+        `📋 *Raw URLs (copy-friendly):*\n\`\`\`\n${urlsOnly}\n\`\`\``,
+        { parse_mode: 'Markdown', disable_web_page_preview: true }
+      );
+    }
+  }).catch(err => {
+    ctx.reply(`❌ /publishfiles error: ${err.message}`).catch(() => {});
+    console.error('[publishfiles] error:', err);
+  });
+});
+
+// ============================================
+// /zip — zip template_result (skip _debug + _temp) + amp_result/amp
+// Lalu kirim semua zip ke Telegram
+// ============================================
+const ACFOLDER_AMP_RESULT_PATH = path.resolve(__dirname, process.env.ACFOLDER_AMP_RESULT_PATH || '../result/amp_result/amp');
+
+bot.command('zip', async (ctx) => {
+  const msg = await ctx.reply('🗜️ Zipping folders...');
+
+  const outputDir = path.resolve(__dirname, '../result/_zips');
+  fs.mkdirSync(outputDir, { recursive: true });
+
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const reports = [];
+  const successZips = [];
+
+  // ===== ZIP 1: template_result (exclude _debug + _temp) =====
+  try {
+    if (!fs.existsSync(ACFOLDER_RESULT_PATH)) {
+      reports.push(`❌ template_result: folder gak ada`);
+    } else {
+      const zipPath1 = path.join(outputDir, `template_result_${ts}.zip`);
+      await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `🗜️ Zipping template_result...`);
+      const r1 = await zipFolder(ACFOLDER_RESULT_PATH, zipPath1, {
+        exclude: ['_debug', '_temp', '_zips'],
+      });
+      reports.push(`✅ template_result: ${r1.files} files (${(r1.size / 1024).toFixed(1)} KB)`);
+      successZips.push(zipPath1);
+    }
+  } catch (e) {
+    reports.push(`❌ template_result: ${e.message}`);
+  }
+
+  // ===== ZIP 2: amp_result/amp =====
+  try {
+    if (!fs.existsSync(ACFOLDER_AMP_RESULT_PATH)) {
+      reports.push(`❌ amp_result/amp: folder gak ada (${ACFOLDER_AMP_RESULT_PATH})`);
+    } else {
+      const zipPath2 = path.join(outputDir, `amp_result_${ts}.zip`);
+      await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `🗜️ Zipping amp_result/amp...`);
+      const r2 = await zipFolder(ACFOLDER_AMP_RESULT_PATH, zipPath2);
+      reports.push(`✅ amp_result/amp: ${r2.files} files (${(r2.size / 1024).toFixed(1)} KB)`);
+      successZips.push(zipPath2);
+    }
+  } catch (e) {
+    reports.push(`❌ amp_result/amp: ${e.message}`);
+  }
+
+  // ===== Update message dengan report =====
+  let report = `🗜️ *Zip Result*\n\n${reports.join('\n')}\n\n`;
+  if (successZips.length > 0) {
+    report += `📤 Sending ${successZips.length} zip file(s)...`;
+  }
+  await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, report);
+
+  // ===== Kirim zip ke Telegram =====
+  for (const zipPath of successZips) {
+    try {
+      const stat = fs.statSync(zipPath);
+      if (stat.size > 49 * 1024 * 1024) {
+        // Telegram bot limit 50MB
+        await ctx.reply(`⚠️ ${path.basename(zipPath)} > 50 MB, gak bisa kirim Telegram. Path: \`${zipPath}\``);
+        continue;
+      }
+      await ctx.replyWithDocument({
+        source: zipPath,
+        filename: path.basename(zipPath),
+      });
+    } catch (e) {
+      await ctx.reply(`❌ Kirim ${path.basename(zipPath)} error: ${e.message}`);
+    }
+  }
+});
+
+// ============================================
+// /prepareinto <domain>
+// Download GSC files LANGSUNG ke result/template_result/
+// ============================================
+bot.command('prepareinto', async (ctx) => {
+  const domain = ctx.message.text.split(/\s+/)[1];
+  if (!domain) return ctx.reply('Format: `/prepareinto domain.com`');
+
+  const cfg = loadDomainData(domain);
+  if (!cfg) return ctx.reply(`❌ Domain belum di-scan. Run \`/scantargets\` dulu.`);
+
+  if (!fs.existsSync(ACFOLDER_RESULT_PATH)) {
+    return ctx.reply(
+      `❌ Folder belum ada: \`${ACFOLDER_RESULT_PATH}\`\n\n` +
+      `Generate landing page dulu lewat acfolder (run index.php), baru jalanin command ini.`
+    );
+  }
+
+  // Reply cepet biar Telegram gak timeout 90s
+  await ctx.reply(
+    `🤖 Opening Chrome — processing ${cfg.prefixes.length} property...\n` +
+    `📁 Output: \`${ACFOLDER_RESULT_PATH}\`\n` +
+    `_(kalau belum login Google, bot bakal kasih notif untuk kirim /ready)_`
+  );
+
+  // FIRE-AND-FORGET — biar handler return cepet, gak kena 90s timeout
+  withLock(domain, async () => {
+    const msg = await ctx.reply(`🚀 Starting... [0/${cfg.prefixes.length}]`);
+    let lastEdit = 0;
+
+    // Login callbacks — bot bakal kirim notif + nunggu /ready
+    const onLoginRequired = async () => {
+      await ctx.reply(
+        `🔐 *LOGIN GOOGLE DIPERLUKAN*\n\n` +
+        `1️⃣ Chrome udah kebuka di layar lu\n` +
+        `2️⃣ Login Google manual (akun yang punya akses GSC)\n` +
+        `3️⃣ Setelah dashboard GSC kebuka, kirim \`/ready\` di Telegram\n\n` +
+        `⏱️ Bot bakal tunggu max 10 menit.\n` +
+        `❌ Ketik \`/cancel-login\` kalau mau batalkan.`
+      );
+    };
+
+    const waitReady = () => new Promise((resolve, reject) => {
+      const timeoutHandle = setTimeout(() => {
+        loginReadyState.delete(ctx.from.id);
+        reject(new Error('Login timeout 10 menit. /prepareinto dibatalkan.'));
+      }, 10 * 60 * 1000);
+      loginReadyState.set(ctx.from.id, { resolve, reject, timeoutHandle });
+    });
+
+    const results = await downloadVerificationFiles(
+      domain,
+      cfg.prefixes,
+      ACFOLDER_RESULT_PATH,
+      (current, total, prefix) => {
+        const now = Date.now();
+        if (now - lastEdit < 2000 && current !== total) return;
+        lastEdit = now;
+        ctx.telegram.editMessageText(
+          ctx.chat.id, msg.message_id, null,
+          `🤖 [${current}/${total}] Processing\n\`${prefix}\``
+        ).catch(() => {});
+      },
+      { skipReadme: true, onLoginRequired, waitReady }
+    );
+
+    updateStatus(domain, { addedProperties: results.filter(r => r.success).map(r => r.prefix) });
+
+    let report = `✅ *GSC Files Written to acfolder*\n\n`;
+    report += `📁 Output: \`${ACFOLDER_RESULT_PATH}\`\n\n`;
+    results.forEach(r => {
+      const folder = prefixToFolderPath(r.prefix) || '(root)';
+      report += `${r.success ? '✅' : '❌'} \`${folder}/${r.fileName || '?'}\``;
+      if (r.error) report += ` _(${r.error})_`;
+      report += `\n`;
+    });
+    const ok = results.filter(r => r.success).length;
+    report += `\n📦 ${ok}/${results.length} files berhasil\n\n`;
+    report += `👉 Upload \`template_result/\` ke domain, lalu \`/verify ${domain}\``;
+
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, report);
+  })(ctx).catch(err => {
+    ctx.reply(`❌ /prepareinto error: ${err.message}`).catch(() => {});
+    console.error('[prepareinto] background error:', err);
+  });
+});
+
+// ============================================
+// /prepare <domain>
+// ============================================
+bot.command('prepare', async (ctx) => {
+  const domain = ctx.message.text.split(/\s+/)[1];
+  if (!domain) return ctx.reply('Format: `/prepare domain.com`');
+
+  const cfg = loadDomainData(domain);
+  if (!cfg) return ctx.reply(`❌ Domain belum di-scan. Run /scan dulu.`);
+
+  return withLock(domain, async () => {
+    // Cleanup file lama dulu biar gak campur dengan run baru
+    cleanGscFiles(domain);
+
+    const msg = await ctx.reply(
+      `🤖 Opening Chrome — processing ${cfg.prefixes.length} property...\n_(first run: login Google manual di browser)_`
+    );
+
+    const baseDir = path.join(domainDir(domain), 'gsc-files');
+    let lastEdit = 0;
+
+    const results = await downloadVerificationFiles(
+      domain,
+      cfg.prefixes,
+      baseDir,
+      (current, total, prefix) => {
+        const now = Date.now();
+        if (now - lastEdit < 2000 && current !== total) return;
+        lastEdit = now;
+        ctx.telegram.editMessageText(
+          ctx.chat.id, msg.message_id, null,
+          `🤖 [${current}/${total}] Processing\n\`${prefix}\``
+        ).catch(() => {});
+      }
+    );
+
+    updateStatus(domain, { addedProperties: results.filter(r => r.success).map(r => r.prefix) });
+
+    // Bikin master README di root gsc-files biar lo gampang pas extract
+    const masterReadme =
+`============================================
+GSC VERIFICATION ZIP — ${domain}
+============================================
+
+CARA UPLOAD (PALING GAMPANG):
+
+1. Extract zip ini LANGSUNG di ROOT domain lo.
+   Contoh kalo pake FileZilla:
+   - Connect ke FTP
+   - Pindah ke folder public_html (atau document root)
+   - Drag semua isi zip ke sini
+
+2. File HTML akan auto-masuk ke folder yang sesuai:
+   - File di root zip   -> upload ke ROOT domain (untuk property /)
+   - File di /service/  -> upload ke domain.com/service/
+   - File di /job/      -> upload ke domain.com/job/
+   - dst...
+
+3. Pastikan masing-masing file bisa diakses via URL:
+   https://${domain}/google-XXX.html
+   https://${domain}/service/google-YYY.html
+   https://${domain}/job/google-ZZZ.html
+
+4. Setelah semua file ke-upload, balik ke Telegram:
+   /verify ${domain}
+
+CATATAN:
+- Tiap subfolder berisi file UPLOAD_KE.txt yang kasih tau URL upload-nya
+- Kalo folder belum ada di domain, FTP client akan auto-create
+- File UPLOAD_KE.txt boleh dihapus setelah upload (cuma info)
+============================================
+`;
+    fs.writeFileSync(path.join(baseDir, 'README.txt'), masterReadme);
+
+    // Zip
+    const zipPath = path.join(domainDir(domain), 'gsc-files.zip');
+    await zipFolder(baseDir, zipPath);
+
+    let report = `✅ *GSC Files Ready*\n\n`;
+    results.forEach(r => {
+      report += `${r.success ? '✅' : '❌'} \`${r.prefix}\``;
+      if (r.fileName) report += ` → \`${r.fileName}\``;
+      if (r.error) report += ` _(${r.error})_`;
+      report += `\n`;
+    });
+    const ok = results.filter(r => r.success).length;
+    report += `\n📦 ${ok}/${results.length} files berhasil\n\n`;
+    report += `👉 Extract zip, upload ke domain sesuai folder, lalu \`/verify ${domain}\``;
+
+    await ctx.replyWithDocument(
+      { source: zipPath, filename: `${domain}-gsc.zip` },
+      { caption: report }
+    );
+  })(ctx);
+});
+
+// ============================================
+// /verify <domain>
+// ============================================
+bot.command('verify', async (ctx) => {
+  const domain = ctx.message.text.split(/\s+/)[1];
+  if (!domain) return ctx.reply('Format: `/verify domain.com`');
+
+  const cfg = loadDomainData(domain);
+  if (!cfg) return ctx.reply(`❌ Domain belum di-scan.`);
+
+  return withLock(domain, async () => {
+    const msg = await ctx.reply(`🔐 Verifying ${cfg.prefixes.length} property...`);
+
+    let lastEdit = 0;
+    const results = await verifyProperties(
+      domain,
+      cfg.prefixes,
+      (current, total, prefix) => {
+        const now = Date.now();
+        if (now - lastEdit < 2000 && current !== total) return;
+        lastEdit = now;
+        ctx.telegram.editMessageText(
+          ctx.chat.id, msg.message_id, null,
+          `🔐 [${current}/${total}] \`${prefix}\``
+        ).catch(() => {});
+      }
+    );
+
+    updateStatus(domain, { verifiedProperties: results.filter(r => r.verified).map(r => r.prefix) });
+
+    let report = `🔐 *Verification Result*\n\n`;
+    results.forEach(r => {
+      report += `${r.verified ? '✅' : '❌'} \`${r.prefix}\``;
+      if (r.error) report += ` _(${r.error})_`;
+      report += `\n`;
+    });
+    const ok = results.filter(r => r.verified).length;
+    report += `\n${ok}/${results.length} verified\n\n👉 Next: \`/index ${domain}\``;
+
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, report);
+  })(ctx);
+});
+
+// ============================================
+// /index <domain>
+// ============================================
+bot.command('index', async (ctx) => {
+  const domain = ctx.message.text.split(/\s+/)[1];
+  if (!domain) return ctx.reply('Format: `/index domain.com`');
+
+  const cfg = loadDomainData(domain);
+  if (!cfg) return ctx.reply(`❌ Domain belum di-scan.`);
+
+  return withLock(domain, async () => {
+    const totalEst = Object.values(cfg.urlsByPrefix)
+      .reduce((acc, urls) => acc + Math.min(urls.length, 10), 0);
+    const msg = await ctx.reply(`🚀 Starting indexing — ${totalEst} URL...`);
+
+    let lastEdit = 0;
+    const indexed = [];
+
+    const results = await requestIndexAll(
+      domain,
+      cfg.urlsByPrefix,
+      (current, total, url, success, reason) => {
+        if (success) indexed.push(url);
+        const now = Date.now();
+        if (now - lastEdit < 3000 && current !== total) return;
+        lastEdit = now;
+        const icon = success ? '✅' : (reason === 'QUOTA' ? '🛑' : '❌');
+        ctx.telegram.editMessageText(
+          ctx.chat.id, msg.message_id, null,
+          `🚀 [${current}/${total}] ${icon}\n\`${url.slice(0, 70)}\``
+        ).catch(() => {});
+      }
+    );
+
+    updateStatus(domain, { indexedUrls: indexed, lastIndexAt: Date.now() });
+
+    const ok = results.filter(r => r.success).length;
+    let report = `✅ *Indexing Complete*\n\n`;
+    report += `📊 Submitted : ${ok}/${results.length}\n`;
+    report += `🕒 Time : ${new Date().toLocaleString()}\n\n`;
+    report += `_Quota refresh besok pagi. Sisanya bisa lo jalankan lagi dengan /index ${domain}_`;
+
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, report);
+  })(ctx);
+});
+
+// ============================================
+// /list
+// ============================================
+bot.command('list', (ctx) => {
+  const domains = listDomains();
+  if (domains.length === 0) return ctx.reply('📭 Belum ada domain. Run /scan dulu.');
+
+  let txt = `📋 *Domains (${domains.length})*\n\n`;
+  domains.forEach((d, i) => {
+    const status = loadStatus(d) || {};
+    const cfg = loadDomainData(d);
+    const verified = status.verifiedProperties?.length || 0;
+    const indexed = status.indexedUrls?.length || 0;
+    const total = cfg?.totalUrls || 0;
+    txt += `${i + 1}. \`${d}\`\n   📁 ${verified}/${cfg?.prefixes?.length || 0} verified · 🚀 ${indexed}/${total} indexed\n`;
+  });
+
+  ctx.reply(txt);
+});
+
+// ============================================
+// /status <domain>
+// ============================================
+bot.command('status', (ctx) => {
+  const domain = ctx.message.text.split(/\s+/)[1];
+  if (!domain) return ctx.reply('Format: `/status domain.com`');
+
+  const cfg = loadDomainData(domain);
+  const status = loadStatus(domain);
+  if (!cfg) return ctx.reply(`❌ Domain ${domain} not found.`);
+
+  let txt = `📊 *Status: ${domain}*\n\n`;
+  txt += `📂 Prefixes: ${cfg.prefixes.length}\n`;
+  txt += `📄 Total URL: ${cfg.totalUrls}\n`;
+  txt += `✅ Added: ${status?.addedProperties?.length || 0}\n`;
+  txt += `🔐 Verified: ${status?.verifiedProperties?.length || 0}\n`;
+  txt += `🚀 Indexed: ${status?.indexedUrls?.length || 0}\n`;
+  if (status?.lastIndexAt) {
+    txt += `🕒 Last index: ${new Date(status.lastIndexAt).toLocaleString()}\n`;
+  }
+
+  ctx.reply(txt);
+});
+
+// ============================================
+// /delete <domain>
+// ============================================
+bot.command('delete', (ctx) => {
+  const domain = ctx.message.text.split(/\s+/)[1];
+  if (!domain) return ctx.reply('Format: `/delete domain.com`');
+
+  const ok = deleteDomain(domain);
+  ctx.reply(ok
+    ? `🗑️ Deleted *${domain}* (sitemap + GSC files + status).`
+    : `❌ Domain ${domain} not found.`
+  );
+});
+
+// ============================================
+// /cleanfiles <domain>
+// ============================================
+bot.command('cleanfiles', (ctx) => {
+  const domain = ctx.message.text.split(/\s+/)[1];
+  if (!domain) return ctx.reply('Format: `/cleanfiles domain.com`');
+
+  cleanGscFiles(domain);
+  ctx.reply(`🧹 GSC files & zip untuk *${domain}* dibersihkan.\n_(sitemap & config tetap aman)_`);
+});
+
+// ============================================
+// /reset — nuclear option
+// ============================================
+bot.command('reset', (ctx) => {
+  const count = deleteAllDomains();
+  ctx.reply(`💣 Reset: ${count} domain(s) deleted.`);
+});
+
+// ============================================
+// Run
+// ============================================
+// Telegraf v4: bot.launch() promise only resolves on stop, so log BEFORE launch
+console.log('🤖 Bot starting...');
+console.log(`👥 Allowed users: ${ALLOWED.length ? ALLOWED.join(', ') : 'EVERYONE (set ALLOWED_USER_IDS!)'}`);
+
+bot.launch({
+  onLaunch: () => console.log('✅ Bot LIVE & listening Telegram!'),
+}).catch(err => {
+  console.error('❌ Bot launch failed:', err);
+  process.exit(1);
+});
+
+// Fallback: print confirmation after 2 seconds
+setTimeout(() => {
+  console.log('🤖 Bot running... (kirim /start ke bot di Telegram)');
+}, 2000);
+
+process.once('SIGINT', () => { console.log('\n🛑 Stopping...'); bot.stop('SIGINT'); });
+process.once('SIGTERM', () => { console.log('\n🛑 Stopping...'); bot.stop('SIGTERM'); });
